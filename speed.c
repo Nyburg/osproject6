@@ -1,13 +1,15 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
-#include <stdio.h>
-#include <unistd.h>
 #include <signal.h>
+#include <stdio.h>
+#include <sys/select.h>
+#include <unistd.h>
 
 #define STDIN_FD 0
 #define INPUT_BUF_SIZE 1024
 #define SPEED_MIN 0
+
 static volatile sig_atomic_t g_inc_pending = 0;
 static volatile sig_atomic_t g_dec_pending = 0;
 
@@ -38,11 +40,14 @@ int main(void)
     int speed = 0;
     char buf[INPUT_BUF_SIZE];
 
-    printf("PID=%d\n", (int)getpid());
-    fflush(stdout);
-
     struct sigaction sa1;
     struct sigaction sa2;
+
+    sigset_t block_mask;
+    sigset_t empty_mask;
+
+    printf("PID=%d\n", (int)getpid());
+    fflush(stdout);
 
     sigemptyset(&sa1.sa_mask);
     sa1.sa_flags = 0;
@@ -62,7 +67,20 @@ int main(void)
         return 1;
     }
 
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGUSR1);
+    sigaddset(&block_mask, SIGUSR2);
+
+    sigemptyset(&empty_mask);
+
+    if (sigprocmask(SIG_BLOCK, &block_mask, NULL) != 0) {
+        perror("sigprocmask");
+        return 1;
+    }
+
     for (;;) {
+        fd_set readfds;
+
         while (g_inc_pending || g_dec_pending) {
             if (g_inc_pending) {
                 g_inc_pending = 0;
@@ -77,30 +95,43 @@ int main(void)
                 print_speed_change(0, speed);
             }
         }
-        ssize_t nread = read(STDIN_FD, buf, sizeof(buf));
 
-        if (nread < 0) {
+        FD_ZERO(&readfds);
+        FD_SET(STDIN_FD, &readfds);
+
+        if (pselect(STDIN_FD + 1, &readfds, NULL, NULL, NULL, &empty_mask) < 0) {
             if (errno == EINTR)
                 continue;
-            perror("read");
+            perror("pselect");
             return 1;
         }
 
-        if (nread == 0)
-            continue;
+        if (FD_ISSET(STDIN_FD, &readfds)) {
+            ssize_t nread = read(STDIN_FD, buf, sizeof(buf));
 
-        for (ssize_t i = 0; i < nread; i++) {
-            if (buf[i] == '+') {
-                speed++;
-                print_speed_change(1, speed);
+            if (nread < 0) {
+                if (errno == EINTR)
+                    continue;
+                perror("read");
+                return 1;
             }
-            else if (buf[i] == '-') {
-                if (speed > SPEED_MIN)
-                    speed--;
-                print_speed_change(0, speed);
-            }
-            else if (buf[i] == 'q') {
-                return 0;
+
+            if (nread == 0)
+                continue;
+
+            for (ssize_t i = 0; i < nread; i++) {
+                if (buf[i] == '+') {
+                    speed++;
+                    print_speed_change(1, speed);
+                }
+                else if (buf[i] == '-') {
+                    if (speed > SPEED_MIN)
+                        speed--;
+                    print_speed_change(0, speed);
+                }
+                else if (buf[i] == 'q') {
+                    return 0;
+                }
             }
         }
     }
